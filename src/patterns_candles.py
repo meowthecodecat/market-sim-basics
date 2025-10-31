@@ -11,6 +11,37 @@ import argparse
 import pandas as pd
 import numpy as np
 
+def compute_pattern_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcule les signaux chandeliers en s'appuyant sur les détecteurs internes.
+    Retourne un DataFrame aligné sur l'index de df avec:
+      - signal_candle: synthèse {-1,0,1}
+      - engulfing: {-1,0,1}
+      - hammer: 1 si marteau détecté, 0 sinon
+      - shooting_star: 1 si shooting star détectée, 0 sinon
+      - inside_bar: 1 si inside bar, 0 sinon
+    """
+    required_cols = {"open", "high", "low", "close"}
+    missing = required_cols.difference(df.columns)
+    assert not missing, f"Colonnes manquantes pour les patterns: {missing}"
+
+    s_engulf = _engulfing(df)
+    s_hammer_like = _hammer_like(df)
+    s_inside = _inside_bar(df)
+
+    inside_mask = (
+        (df["high"] < df["high"].shift(1)) &
+        (df["low"] > df["low"].shift(1))
+    )
+
+    indicators = pd.DataFrame(index=df.index)
+    indicators["signal_candle"] = (s_engulf + s_hammer_like + s_inside).clip(-1, 1).astype("int8")
+    indicators["engulfing"] = s_engulf.astype("int8")
+    indicators["hammer"] = (s_hammer_like == 1).astype("int8")
+    indicators["shooting_star"] = (s_hammer_like == -1).astype("int8")
+    indicators["inside_bar"] = inside_mask.fillna(False).astype("int8")
+    return indicators
+
 def _engulfing(df: pd.DataFrame) -> pd.Series:
     o,c,h,l = df["open"], df["close"], df["high"], df["low"]
     body     = c - o
@@ -50,13 +81,10 @@ def detect_signals(candles_csv: str, out_csv: str) -> None:
     for c in ("t0","open","high","low","close"):
         assert c in df.columns, f"Colonne manquante: {c}"
 
-    s1 = _engulfing(df)
-    s2 = _hammer_like(df)
-    s3 = _inside_bar(df)
-
-    sig = (s1 + s2 + s3).clip(-1,1).astype("int8")
+    indicators = compute_pattern_indicators(df)
     out = df.copy()
-    out["signal_candle"] = sig
+    for col in indicators.columns:
+        out[col] = indicators[col].values
     out.to_csv(out_csv, index=False)
 
 def _args():
