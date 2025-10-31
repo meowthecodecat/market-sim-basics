@@ -29,7 +29,7 @@ from backtest import run_bt
 
 # Kraken WS client
 try:
-    from crypto.kraken_ws import stream as kraken_stream
+    from kraken_ws import stream as kraken_stream
     HAS_WS = True
 except Exception:
     HAS_WS = False
