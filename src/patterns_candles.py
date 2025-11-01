@@ -35,11 +35,33 @@ def compute_pattern_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     indicators = pd.DataFrame(index=df.index)
-    indicators["signal_candle"] = (s_engulf + s_hammer_like + s_inside).clip(-1, 1).astype("int8")
+
+    primary_signal = (s_engulf + s_hammer_like + s_inside).clip(-1, 1).astype("int8")
+
+    returns = df["close"].pct_change()
+    abs_ret = returns.abs()
+    rolling_vol = abs_ret.rolling(window=20, min_periods=5).mean()
+    dynamic_eps = (
+        (rolling_vol * 0.75)
+        .fillna(abs_ret.rolling(window=10, min_periods=1).median())
+        .clip(lower=1e-4, upper=8e-3)
+    )
+    returns = returns.fillna(0.0)
+    dynamic_eps = dynamic_eps.fillna(2e-4)
+    mom_signal = np.where(returns > dynamic_eps, 1, np.where(returns < -dynamic_eps, -1, 0)).astype("int8")
+
+    signal = primary_signal.copy()
+    neutral_mask = signal == 0
+    signal.loc[neutral_mask] = mom_signal[neutral_mask]
+
+    indicators["signal_candle"] = signal.astype("int8")
     indicators["engulfing"] = s_engulf.astype("int8")
     indicators["hammer"] = (s_hammer_like == 1).astype("int8")
     indicators["shooting_star"] = (s_hammer_like == -1).astype("int8")
     indicators["inside_bar"] = inside_mask.fillna(False).astype("int8")
+    indicators["ret_pct"] = returns.astype("float32")
+    indicators["mom_threshold"] = dynamic_eps.astype("float32")
+    indicators["mom_signal"] = mom_signal.astype("int8")
     return indicators
 
 def _engulfing(df: pd.DataFrame) -> pd.Series:

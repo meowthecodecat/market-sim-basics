@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -36,7 +36,7 @@ DEFAULT_CANDLE_SEC = 60
 DEFAULT_INITIAL_CASH = 100.0
 DEFAULT_ALLOW_SHORT = False
 DEFAULT_FEE_BPS = 5.0
-PROCESS_INTERVAL_SEC = 5
+PROCESS_INTERVAL_SEC = 1
 MAX_PROCESSED_KEYS = 20_000
 
 class ConfigPayload(BaseModel):
@@ -45,6 +45,11 @@ class ConfigPayload(BaseModel):
     initial_cash: Optional[float] = None
     allow_short: Optional[bool] = None
     fee_bps: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    take_profit_pct: Optional[float] = None
+    max_hold_candles: Optional[int] = None
+    trailing_stop_pct: Optional[float] = None
+    position_scale: Optional[float] = None
 
 @dataclass
 class Snapshot:
@@ -68,6 +73,11 @@ class LiveSimulationState:
         allow_short: bool = DEFAULT_ALLOW_SHORT,
         fee_bps: float = DEFAULT_FEE_BPS,
         process_interval: int = PROCESS_INTERVAL_SEC,
+        stop_loss_pct: Optional[float] = 0.01,
+        take_profit_pct: Optional[float] = 0.02,
+        max_hold_candles: Optional[int] = 180,
+        trailing_stop_pct: Optional[float] = 0.01,
+        position_scale: float = 1.0,
     ) -> None:
         self.lock = threading.Lock()
         self.process_interval = process_interval
@@ -77,12 +87,22 @@ class LiveSimulationState:
         self.initial_cash = initial_cash
         self.allow_short = allow_short
         self.fee_bps = fee_bps
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.max_hold_candles = max_hold_candles
+        self.trailing_stop_pct = trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else None
+        self.position_scale = max(0.2, min(2.0, position_scale)) if position_scale else 1.0
 
         self.feed = KrakenLiveFeed(pair=pair)
         self.simulator = TradingSimulator(
             initial_cash=initial_cash,
             allow_short=allow_short,
             fee_bps=fee_bps,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=self.trailing_stop_pct,
+            max_holding_period=max_hold_candles,
+            position_scale=self.position_scale,
         )
         self.processed_keys: Set[str] = set()
         self.candles_df = pd.DataFrame(columns=["t0", "open", "high", "low", "close", "volume"])
@@ -98,6 +118,7 @@ class LiveSimulationState:
         self.price_timestamp: Optional[datetime] = None
         self.price_reference: Optional[float] = None
         self.price_reference_ts: Optional[datetime] = None
+        self.latest_market_metrics: Optional[dict] = None
 
     # === background management ===========================================
 
@@ -143,13 +164,39 @@ class LiveSimulationState:
         indicators = compute_pattern_indicators(candles_df[["open", "high", "low", "close"]])
         candles_df = pd.concat([candles_df, indicators], axis=1)
 
+        market_metrics_latest = self.feed.get_market_metrics(1).get("latest")
+        self.latest_market_metrics = market_metrics_latest
+        micro_signal, micro_score = self._micro_signal_from_metrics(market_metrics_latest)
+
         new_keys = []
-        for _, row in candles_df.iterrows():
+        for idx, row in candles_df.iterrows():
             key = row["t0"]
             if key in self.processed_keys:
                 continue
             signal = int(row.get("signal_candle", 0))
-            self.simulator.on_candle(row, signal)
+            combined_signal = signal
+            if micro_signal:
+                if combined_signal == 0:
+                    combined_signal = micro_signal
+                else:
+                    mix = combined_signal + micro_signal
+                    if mix > 0:
+                        combined_signal = 1
+                    elif mix < 0:
+                        combined_signal = -1
+            enriched_row = row.copy()
+            enriched_row["signal_micro_live"] = micro_signal
+            enriched_row["micro_score"] = micro_score
+            if market_metrics_latest:
+                enriched_row["depth_imb_live"] = market_metrics_latest.get("depth_imbalance")
+                enriched_row["spread_bp_live"] = market_metrics_latest.get("spread_bp")
+            candles_df.at[idx, "signal_micro_live"] = micro_signal
+            candles_df.at[idx, "micro_score"] = micro_score
+            candles_df.at[idx, "signal_combined"] = combined_signal
+            if market_metrics_latest:
+                candles_df.at[idx, "depth_imb_live"] = market_metrics_latest.get("depth_imbalance")
+                candles_df.at[idx, "spread_bp_live"] = market_metrics_latest.get("spread_bp")
+            self.simulator.on_candle(enriched_row, combined_signal)
             self.processed_keys.add(key)
             new_keys.append(key)
 
@@ -170,6 +217,10 @@ class LiveSimulationState:
             self.summary["feed_running"] = self.feed.is_running()
             self.summary["pair"] = self.feed_pair
             self.summary["candle_sec"] = self.candle_sec
+            if self.latest_market_metrics:
+                self.summary["market_latency_ms"] = self.latest_market_metrics.get("latency_ms")
+                self.summary["depth_imbalance"] = self.latest_market_metrics.get("depth_imbalance")
+                self.summary["spread_bp"] = self.latest_market_metrics.get("spread_bp")
             self.last_update = datetime.now(timezone.utc)
             price_info = self.feed.price_metrics()
             self.last_price = price_info.get("last_mid")
@@ -210,6 +261,42 @@ class LiveSimulationState:
                 last_update=self.last_update,
             )
 
+    def order_book(self, depth: int) -> dict:
+        depth = max(1, depth)
+        feed_depth = getattr(self.feed, "depth", depth)
+        if feed_depth:
+            depth = min(depth, int(feed_depth))
+        ob = self.feed.get_order_book(depth)
+        ts = ob.get("timestamp")
+        return {
+            "timestamp": ts.isoformat() if isinstance(ts, datetime) else ts,
+            "bids": ob.get("bids", []),
+            "asks": ob.get("asks", []),
+            "latency_ms": ob.get("latency_ms"),
+        }
+
+    def market_metrics(self, history: int = 120) -> dict:
+        history = max(1, history)
+        metrics = self.feed.get_market_metrics(history)
+        latest = metrics.get("latest")
+        if latest:
+            self.latest_market_metrics = latest
+        return metrics
+
+    def _micro_signal_from_metrics(self, metrics: Optional[dict]) -> tuple[int, float]:
+        if not metrics:
+            return 0, 0.0
+        depth_imb = metrics.get("depth_imbalance")
+        if depth_imb is None:
+            return 0, 0.0
+        spread_bp = metrics.get("spread_bp") or 0.0
+        volatility = metrics.get("volatility") or 0.0
+        adaptive_tau = max(0.05, min(0.6, 0.18 + (volatility * 4.0) + (abs(spread_bp) * 0.002)))
+        score = depth_imb
+        if abs(score) > adaptive_tau:
+            return (1 if score > 0 else -1), score
+        return 0, score
+
     def update_config(self, payload: ConfigPayload) -> None:
         reinit_sim = False
         restart_feed = False
@@ -235,12 +322,32 @@ class LiveSimulationState:
         if payload.fee_bps is not None and payload.fee_bps != self.fee_bps:
             self.fee_bps = payload.fee_bps
             reinit_sim = True
+        if payload.stop_loss_pct is not None:
+            self.stop_loss_pct = max(0.0, payload.stop_loss_pct)
+            reinit_sim = True
+        if payload.take_profit_pct is not None:
+            self.take_profit_pct = max(0.0, payload.take_profit_pct)
+            reinit_sim = True
+        if payload.max_hold_candles is not None:
+            self.max_hold_candles = max(1, int(payload.max_hold_candles))
+            reinit_sim = True
+        if payload.trailing_stop_pct is not None:
+            self.trailing_stop_pct = payload.trailing_stop_pct if payload.trailing_stop_pct and payload.trailing_stop_pct > 0 else None
+            reinit_sim = True
+        if payload.position_scale is not None:
+            self.position_scale = max(0.2, min(2.0, float(payload.position_scale)))
+            reinit_sim = True
 
         if reinit_sim:
             self.simulator = TradingSimulator(
                 initial_cash=self.initial_cash,
                 allow_short=self.allow_short,
                 fee_bps=self.fee_bps,
+                stop_loss_pct=self.stop_loss_pct,
+                take_profit_pct=self.take_profit_pct,
+                trailing_stop_pct=self.trailing_stop_pct,
+                max_holding_period=self.max_hold_candles,
+                position_scale=self.position_scale,
             )
             self.processed_keys.clear()
 
@@ -253,15 +360,25 @@ class LiveSimulationState:
             initial_cash=self.initial_cash,
             allow_short=self.allow_short,
             fee_bps=self.fee_bps,
+            stop_loss_pct=self.stop_loss_pct,
+            take_profit_pct=self.take_profit_pct,
+            trailing_stop_pct=self.trailing_stop_pct,
+            max_holding_period=self.max_hold_candles,
+            position_scale=self.position_scale,
         )
         self.processed_keys.clear()
 
 app = FastAPI(title="Live BTC Bot Simulator", version="1.0")
 STATE = LiveSimulationState()
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
-if STATIC_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=STATIC_DIR, html=False), name="assets")
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+STATIC_BUILD_DIR = FRONTEND_DIR / "dist"
+if STATIC_BUILD_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=STATIC_BUILD_DIR, html=False), name="assets")
+else:
+    legacy_assets = FRONTEND_DIR if FRONTEND_DIR.exists() else None
+    if legacy_assets:
+        app.mount("/assets", StaticFiles(directory=legacy_assets, html=False), name="assets")
 
 @app.on_event("startup")
 async def _startup() -> None:
@@ -273,7 +390,9 @@ async def _shutdown() -> None:
 
 @app.get("/", response_class=FileResponse)
 def root():
-    index_path = STATIC_DIR / "index.html"
+    index_path = STATIC_BUILD_DIR / "index.html"
+    if not index_path.exists():
+        index_path = FRONTEND_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Frontend missing")
     return FileResponse(index_path)
@@ -292,6 +411,12 @@ def get_status():
     data["price_reference_ts"] = (
         STATE.price_reference_ts.isoformat() if STATE.price_reference_ts else None
     )
+    metrics_latest = STATE.market_metrics(history=0).get("latest")
+    data["market_metrics"] = metrics_latest
+    if metrics_latest:
+        data["market_latency_ms"] = metrics_latest.get("latency_ms")
+    data["feed_status"] = STATE.feed.status()
+    data["feed_running"] = STATE.feed.is_running()
     return data
 
 @app.get("/candles")
@@ -313,6 +438,15 @@ def get_equity(limit: int = 500):
         "count": len(history),
         "equity": history.to_dict(orient="records"),
     }
+
+@app.get("/market_metrics")
+def get_market_metrics(history: int = 120):
+    history = max(1, min(history, 600))
+    return STATE.market_metrics(history)
+
+@app.get("/orderbook")
+def get_orderbook(depth: int = 15):
+    return STATE.order_book(depth)
 
 @app.get("/bot_trades")
 def get_bot_trades(limit: int = 100):
@@ -336,6 +470,9 @@ class ConfigSnapshot:
     initial_cash: float
     allow_short: bool
     fee_bps: float
+    stop_loss_pct: Optional[float]
+    take_profit_pct: Optional[float]
+    max_hold_candles: Optional[int]
 
 def _current_config():
     return ConfigSnapshot(
@@ -344,6 +481,9 @@ def _current_config():
         initial_cash=STATE.initial_cash,
         allow_short=STATE.allow_short,
         fee_bps=STATE.fee_bps,
+        stop_loss_pct=STATE.stop_loss_pct,
+        take_profit_pct=STATE.take_profit_pct,
+        max_hold_candles=STATE.max_hold_candles,
     )
 
 @app.post("/config")

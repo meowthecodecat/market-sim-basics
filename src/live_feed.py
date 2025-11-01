@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, List, Optional
 
+import statistics
+
 import pandas as pd
 import websockets
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
@@ -73,6 +75,9 @@ class KrakenLiveFeed:
         self._trades: Deque[Dict[str, float]] = deque()
         self._lock = threading.Lock()
         self._book_snapshot: Optional[BookSnapshot] = None
+        self._book_levels: Optional[dict] = None
+        self._metrics_history: Deque[Dict[str, float]] = deque(maxlen=1200)
+        self._last_metric: Optional[Dict[str, float]] = None
         self._status: str = "init"
         self._first_mid: Optional[float] = None
         self._first_mid_ts: Optional[datetime] = None
@@ -198,20 +203,68 @@ class KrakenLiveFeed:
                         spread = max(ask_px - bid_px, 0.0)
                     else:
                         mid = spread = None
-
-                    self._book_snapshot = BookSnapshot(
-                        timestamp=datetime.now(timezone.utc),
-                        bid_px=bid_px,
-                        bid_qty=bid_qty,
-                        ask_px=ask_px,
-                        ask_qty=ask_qty,
-                        mid=mid,
-                        spread=spread,
+                    sorted_bids = sorted(
+                        ((px, qty) for px, qty in bids.items() if qty > 0.0),
+                        key=lambda x: x[0],
+                        reverse=True,
                     )
+                    sorted_asks = sorted(
+                        ((px, qty) for px, qty in asks.items() if qty > 0.0),
+                        key=lambda x: x[0],
+                    )
+
                     n_book += 1
-                    if mid is not None:
+                    with self._lock:
                         now_ts = datetime.now(timezone.utc)
-                        with self._lock:
+                        prev_mid = (
+                            self._last_metric.get("mid")
+                            if self._last_metric and self._last_metric.get("mid") not in (None, 0.0)
+                            else None
+                        )
+                        bid_volume = sum(qty for _, qty in sorted_bids[: self.depth])
+                        ask_volume = sum(qty for _, qty in sorted_asks[: self.depth])
+                        total_volume = bid_volume + ask_volume
+                        depth_imb = (
+                            (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0.0
+                        )
+                        spread_bp = (
+                            (spread / mid) * 1e4
+                            if (mid not in (None, 0.0) and spread is not None)
+                            else None
+                        )
+                        mid_ret = (
+                            ((mid - prev_mid) / prev_mid)
+                            if (prev_mid not in (None, 0.0) and mid not in (None, 0.0))
+                            else 0.0
+                        )
+
+                        self._book_snapshot = BookSnapshot(
+                            timestamp=now_ts,
+                            bid_px=bid_px,
+                            bid_qty=bid_qty,
+                            ask_px=ask_px,
+                            ask_qty=ask_qty,
+                            mid=mid,
+                            spread=spread,
+                        )
+                        self._book_levels = {
+                            "timestamp": now_ts,
+                            "bids": sorted_bids[: self.depth],
+                            "asks": sorted_asks[: self.depth],
+                        }
+                        metric = {
+                            "timestamp": now_ts,
+                            "mid": mid,
+                            "spread": spread,
+                            "spread_bp": spread_bp,
+                            "depth_imbalance": depth_imb,
+                            "bid_volume": bid_volume,
+                            "ask_volume": ask_volume,
+                            "mid_ret": mid_ret,
+                        }
+                        self._metrics_history.append(metric)
+                        self._last_metric = metric
+                        if mid is not None:
                             if self._first_mid is None:
                                 self._first_mid = mid
                                 self._first_mid_ts = now_ts
@@ -241,3 +294,71 @@ class KrakenLiveFeed:
         cutoff = datetime.now(timezone.utc) - self.max_age
         while self._trades and self._trades[0]["timestamp"] < cutoff:
             self._trades.popleft()
+
+    def get_order_book(self, depth: Optional[int] = None) -> dict:
+        with self._lock:
+            levels = self._book_levels
+        if not levels:
+            return {"timestamp": None, "bids": [], "asks": []}
+        max_depth = depth if depth is not None else self.depth
+        bids = [
+            {"price": float(price), "qty": float(qty)}
+            for price, qty in levels["bids"][:max_depth]
+        ]
+        asks = [
+            {"price": float(price), "qty": float(qty)}
+            for price, qty in levels["asks"][:max_depth]
+        ]
+        ts = levels.get("timestamp")
+        latency_ms = None
+        if isinstance(ts, datetime):
+            latency_ms = (datetime.now(timezone.utc) - ts).total_seconds() * 1000.0
+            ts_out = ts.isoformat()
+        else:
+            ts_out = ts
+        return {
+            "timestamp": ts_out,
+            "bids": bids,
+            "asks": asks,
+            "latency_ms": latency_ms,
+        }
+
+    def get_market_metrics(self, max_points: int = 120) -> dict:
+        with self._lock:
+            history = list(self._metrics_history)[-max_points:]
+            latest = self._last_metric.copy() if self._last_metric else None
+        def _serialize(entry):
+            if entry is None:
+                return None
+            out = entry.copy()
+            ts = out.get("timestamp")
+            if isinstance(ts, datetime):
+                out["timestamp"] = ts
+            return out
+
+        history_raw = [_serialize(e) for e in history]
+        latest_raw = _serialize(latest)
+
+        now = datetime.now(timezone.utc)
+        def _to_json(entry):
+            if entry is None:
+                return None
+            out = entry.copy()
+            ts = out.get("timestamp")
+            if isinstance(ts, datetime):
+                out["timestamp"] = ts.isoformat()
+                out["latency_ms"] = (now - ts).total_seconds() * 1000.0
+            return out
+
+        history_json = [_to_json(e) for e in history_raw]
+        latest_json = _to_json(latest_raw)
+
+        rets = [e["mid_ret"] for e in history_raw if e and e.get("mid_ret") is not None]
+        volatility = statistics.pstdev(rets) if len(rets) >= 2 else 0.0
+        if latest_json is not None:
+            latest_json["volatility"] = volatility
+        return {
+            "latest": latest_json,
+            "history": history_json,
+            "volatility": volatility,
+        }

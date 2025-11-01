@@ -1,0 +1,25 @@
+{
+  "name": "btc-live-bot-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.0",
+    "clsx": "^2.0.0",
+    "framer-motion": "^11.0.0",
+    "html2canvas": "^1.4.1",
+    "lightweight-charts": "^4.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.1.0",
+    "vite": "^5.0.0"
+  }
+}
+
