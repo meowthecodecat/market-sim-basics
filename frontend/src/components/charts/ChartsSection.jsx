@@ -12,9 +12,10 @@ export default function ChartsSection() {
 
   useEffect(() => {
     if (!chartRef.current) return;
-    import('chart.js').then(({ Chart }) => {
+    import('chart.js/auto').then(({ default: Chart }) => {
       if (chartInstanceRef.current) {
         chartInstanceRef.current.destroy();
+        chartInstanceRef.current = null;
       }
       const ctx = chartRef.current.getContext('2d');
       chartInstanceRef.current = new Chart(ctx, {

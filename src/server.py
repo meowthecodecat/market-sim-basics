@@ -50,6 +50,7 @@ class ConfigPayload(BaseModel):
     max_hold_candles: Optional[int] = None
     trailing_stop_pct: Optional[float] = None
     position_scale: Optional[float] = None
+    max_leverage: Optional[float] = None
 
 @dataclass
 class Snapshot:
@@ -78,6 +79,7 @@ class LiveSimulationState:
         max_hold_candles: Optional[int] = 180,
         trailing_stop_pct: Optional[float] = 0.01,
         position_scale: float = 1.0,
+        max_leverage: float = 1.0,
     ) -> None:
         self.lock = threading.Lock()
         self.process_interval = process_interval
@@ -92,6 +94,7 @@ class LiveSimulationState:
         self.max_hold_candles = max_hold_candles
         self.trailing_stop_pct = trailing_stop_pct if trailing_stop_pct and trailing_stop_pct > 0 else None
         self.position_scale = max(0.2, min(2.0, position_scale)) if position_scale else 1.0
+        self.max_leverage = max(1.0, float(max_leverage)) if max_leverage else 1.0
 
         self.feed = KrakenLiveFeed(pair=pair)
         self.simulator = TradingSimulator(
@@ -103,6 +106,7 @@ class LiveSimulationState:
             trailing_stop_pct=self.trailing_stop_pct,
             max_holding_period=max_hold_candles,
             position_scale=self.position_scale,
+            max_leverage=self.max_leverage,
         )
         self.processed_keys: Set[str] = set()
         self.candles_df = pd.DataFrame(columns=["t0", "open", "high", "low", "close", "volume"])
@@ -283,6 +287,10 @@ class LiveSimulationState:
             self.latest_market_metrics = latest
         return metrics
 
+    def logs(self, limit: int = 200) -> List[dict]:
+        limit = max(1, min(limit, self.simulator.max_debug_entries))
+        return self.simulator.logs(limit)
+
     def _micro_signal_from_metrics(self, metrics: Optional[dict]) -> tuple[int, float]:
         if not metrics:
             return 0, 0.0
@@ -291,7 +299,15 @@ class LiveSimulationState:
             return 0, 0.0
         spread_bp = metrics.get("spread_bp") or 0.0
         volatility = metrics.get("volatility") or 0.0
-        adaptive_tau = max(0.05, min(0.6, 0.18 + (volatility * 4.0) + (abs(spread_bp) * 0.002)))
+        adaptive_tau = max(
+            0.02,
+            min(
+                0.35,
+                0.06
+                + (volatility * 2.5)
+                + (abs(spread_bp) * 0.0015),
+            ),
+        )
         score = depth_imb
         if abs(score) > adaptive_tau:
             return (1 if score > 0 else -1), score
@@ -337,6 +353,9 @@ class LiveSimulationState:
         if payload.position_scale is not None:
             self.position_scale = max(0.2, min(2.0, float(payload.position_scale)))
             reinit_sim = True
+        if payload.max_leverage is not None:
+            self.max_leverage = max(1.0, float(payload.max_leverage))
+            reinit_sim = True
 
         if reinit_sim:
             self.simulator = TradingSimulator(
@@ -348,6 +367,7 @@ class LiveSimulationState:
                 trailing_stop_pct=self.trailing_stop_pct,
                 max_holding_period=self.max_hold_candles,
                 position_scale=self.position_scale,
+                max_leverage=self.max_leverage,
             )
             self.processed_keys.clear()
 
@@ -365,6 +385,7 @@ class LiveSimulationState:
             trailing_stop_pct=self.trailing_stop_pct,
             max_holding_period=self.max_hold_candles,
             position_scale=self.position_scale,
+            max_leverage=self.max_leverage,
         )
         self.processed_keys.clear()
 
@@ -456,6 +477,15 @@ def get_bot_trades(limit: int = 100):
         "limit": limit,
         "count": len(trades),
         "trades": trades.to_dict(orient="records"),
+    }
+
+@app.get("/logs")
+def get_logs(limit: int = 200):
+    logs = STATE.logs(limit)
+    return {
+        "limit": limit,
+        "count": len(logs),
+        "logs": logs,
     }
 
 @app.post("/reset")

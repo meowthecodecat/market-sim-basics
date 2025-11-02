@@ -15,6 +15,7 @@ export default function TradesTable() {
             <th>Price</th>
             <th>Equity</th>
             <th>PnL</th>
+            <th>Reason</th>
             <th>Context</th>
           </tr>
         </thead>
@@ -26,6 +27,7 @@ export default function TradesTable() {
               <td>{fmtCurrency(row.price)}</td>
               <td>{fmtCurrency(row.equity)}</td>
               <td className={Number(row.pnl ?? 0) >= 0 ? 'long' : 'short'}>{fmtCurrency(row.pnl ?? 0)}</td>
+              <td>{row.reason ?? '-'}</td>
               <td>{row.context ?? '-'}</td>
             </tr>
           ))}

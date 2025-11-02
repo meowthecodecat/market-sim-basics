@@ -1,6 +1,21 @@
 export const fmtCurrency = (value, opts = {}) => {
   if (value == null || Number.isNaN(Number(value))) return '--';
-  return Number(value).toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2, ...opts });
+  const numericValue = Number(value);
+  const baseOpts = {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+    ...opts,
+  };
+  if (baseOpts.minimumFractionDigits != null) {
+    const minDigits = Number(baseOpts.minimumFractionDigits);
+    const hasMax = baseOpts.maximumFractionDigits != null;
+    const maxDigits = hasMax ? Number(baseOpts.maximumFractionDigits) : minDigits;
+    baseOpts.minimumFractionDigits = minDigits;
+    baseOpts.maximumFractionDigits = Math.max(maxDigits, minDigits);
+  }
+  return numericValue.toLocaleString('en-US', baseOpts);
 };
 
 export const fmtPercent = (value, opts = {}) => {

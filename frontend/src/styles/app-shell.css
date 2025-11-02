@@ -311,7 +311,13 @@
 .badge-list li { display: flex; gap: 0.8rem; align-items: center; }
 .badge-icon { width: 32px; height: 32px; border-radius: 999px; background: rgba(93, 139, 255, 0.25); display: grid; place-items: center; color: var(--accent); font-size: 1rem; }
 
-.kraken-widget-panel .kraken-widget-container { min-height: 160px; display: flex; align-items: center; justify-content: center; background: var(--bg-panel-alt); border: 1px dashed var(--panel-border); border-radius: 1.2rem; }
+.kraken-widget-panel .kraken-widget-container { min-height: 160px; display: flex; flex-direction: column; gap: 1rem; align-items: stretch; justify-content: center; background: var(--bg-panel-alt); border: 1px dashed var(--panel-border); border-radius: 1.2rem; padding: 1.4rem; }
+.kraken-widget-price { display: flex; flex-direction: column; gap: 0.4rem; text-align: center; }
+.kraken-widget-price strong { font-size: 1.6rem; font-weight: 600; }
+.kraken-widget-price .micro-diff { font-size: 0.95rem; }
+.kraken-widget-grid { display: grid; gap: 0.8rem; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+.kraken-widget-grid div { background: rgba(148, 163, 184, 0.08); padding: 0.8rem; border-radius: 0.8rem; display: flex; flex-direction: column; gap: 0.3rem; text-align: left; }
+.kraken-widget-note { font-size: 0.8rem; color: var(--text-muted); text-align: center; margin: 0; }
 
 .shortcuts-overlay { position: fixed; inset: 0; background: rgba(5, 8, 20, 0.7); display: grid; place-items: center; z-index: 50; backdrop-filter: blur(12px); }
 .shortcuts-panel { background: var(--bg-panel); padding: 2rem; border-radius: 1.4rem; border: 1px solid var(--panel-border); box-shadow: var(--panel-shadow); width: min(420px, 90vw); }
